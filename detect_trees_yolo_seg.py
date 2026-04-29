@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 import cv2
@@ -50,14 +51,36 @@ def box_iou(a, b):
     return inter / (area_a + area_b - inter)
 
 
-def nms_detections(detections, iou_threshold):
+def is_center_duplicate(det, existing, center_factor, min_radius_ratio):
+    if center_factor <= 0:
+        return False
+
+    r1 = float(det["radius"])
+    r2 = float(existing["radius"])
+    min_radius = min(r1, r2)
+    max_radius = max(r1, r2)
+    if min_radius <= 0 or max_radius <= 0:
+        return False
+
+    radius_ratio = min_radius / max_radius
+    if radius_ratio < min_radius_ratio:
+        return False
+
+    distance = math.hypot(det["x"] - existing["x"], det["y"] - existing["y"])
+    return distance <= max(8.0, min_radius * center_factor)
+
+
+def nms_detections(detections, iou_threshold, center_factor=1.25, min_radius_ratio=0.40):
     kept = []
     for det in sorted(detections, key=lambda d: d["conf"], reverse=True):
         box = (det["x1"], det["y1"], det["x2"], det["y2"])
         duplicate = False
         for existing in kept:
             existing_box = (existing["x1"], existing["y1"], existing["x2"], existing["y2"])
-            if box_iou(box, existing_box) >= iou_threshold:
+            if (
+                box_iou(box, existing_box) >= iou_threshold
+                or is_center_duplicate(det, existing, center_factor, min_radius_ratio)
+            ):
                 duplicate = True
                 break
         if not duplicate:
@@ -117,7 +140,15 @@ def predict_full_image(model, source: Path, conf: float, imgsz: int):
     return detections
 
 
-def predict_tiled(model, img, conf: float, tile_size: int, overlap: float, nms_iou: float):
+def predict_tiled(
+    model,
+    img,
+    conf: float,
+    tile_size: int,
+    overlap: float,
+    nms_iou: float,
+    nms_center_factor: float,
+):
     h, w = img.shape[:2]
     detections = []
 
@@ -153,7 +184,11 @@ def predict_tiled(model, img, conf: float, tile_size: int, overlap: float, nms_i
                 "y2": gy2,
             })
 
-    detections = nms_detections(detections, nms_iou)
+    detections = nms_detections(
+        detections,
+        nms_iou,
+        center_factor=nms_center_factor,
+    )
     for idx, det in enumerate(sorted(detections, key=lambda d: (d["y"], d["x"])), 1):
         det["id"] = idx
     return detections
@@ -177,7 +212,8 @@ def draw_detections(img, detections):
 
 
 def process_image(source: Path, model, out_dir: Path, conf: float,
-                  tile_size: int, overlap: float, nms_iou: float, full_image: bool):
+                  tile_size: int, overlap: float, nms_iou: float,
+                  nms_center_factor: float, full_image: bool):
     img = cv2.imread(str(source))
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {source}")
@@ -194,6 +230,7 @@ def process_image(source: Path, model, out_dir: Path, conf: float,
             tile_size=tile_size,
             overlap=overlap,
             nms_iou=nms_iou,
+            nms_center_factor=nms_center_factor,
         )
 
     vis = draw_detections(img, detections)
@@ -204,7 +241,8 @@ def process_image(source: Path, model, out_dir: Path, conf: float,
 
 
 def process_batch(sources, model_path: Path, out_dir: Path, conf: float,
-                  tile_size: int, overlap: float, nms_iou: float, full_image: bool):
+                  tile_size: int, overlap: float, nms_iou: float,
+                  nms_center_factor: float, full_image: bool):
     if not sources:
         raise FileNotFoundError("没有找到可处理的图片")
 
@@ -218,6 +256,7 @@ def process_batch(sources, model_path: Path, out_dir: Path, conf: float,
             tile_size=tile_size,
             overlap=overlap,
             nms_iou=nms_iou,
+            nms_center_factor=nms_center_factor,
             full_image=full_image,
         )
 
@@ -231,6 +270,8 @@ def parse_args():
     parser.add_argument("--tile-size", type=int, default=640, help="滑窗推理切片尺寸")
     parser.add_argument("--overlap", type=float, default=0.30, help="滑窗推理重叠比例")
     parser.add_argument("--nms-iou", type=float, default=0.45, help="滑窗结果合并 IoU 阈值")
+    parser.add_argument("--nms-center-factor", type=float, default=1.25,
+                        help="滑窗结果中心距离去重系数，0 表示关闭")
     parser.add_argument("--full-image", action="store_true", help="关闭滑窗，直接整图推理")
     return parser.parse_args()
 
@@ -247,5 +288,6 @@ if __name__ == "__main__":
         tile_size=args.tile_size,
         overlap=args.overlap,
         nms_iou=args.nms_iou,
+        nms_center_factor=args.nms_center_factor,
         full_image=args.full_image,
     )

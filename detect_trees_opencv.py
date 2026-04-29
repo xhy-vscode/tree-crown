@@ -553,6 +553,7 @@ def _candidate_quality(det):
 
     circularity = float(det.get("circularity", 0.0) or 0.0)
     fill_ratio = float(det.get("fill_ratio", 0.0) or 0.0)
+    green_ratio = float(det.get("green_ratio", 0.0) or 0.0)
     radius = float(det.get("radius", 0.0) or 0.0)
     area = float(det.get("area_px", 0.0) or 0.0)
 
@@ -563,6 +564,7 @@ def _candidate_quality(det):
         source_rank * 100.0
         + circularity * 14.0
         + fill_ratio * 18.0
+        + green_ratio * 16.0
         + area_bonus * 5.0
         - radius_penalty
     )
@@ -615,6 +617,88 @@ def dedupe_candidate_pool(detections, merge_overlap=0.74):
         kept.append(det)
 
     return kept
+
+
+def _is_dense_duplicate_candidate(
+    det,
+    existing,
+    center_factor=1.80,
+    min_overlap=0.10,
+    min_radius_ratio=0.35,
+):
+    dx = det["x"] - existing["x"]
+    dy = det["y"] - existing["y"]
+    distance = math.hypot(dx, dy)
+
+    r1 = float(det["radius"])
+    r2 = float(existing["radius"])
+    min_radius = min(r1, r2)
+    max_radius = max(r1, r2)
+    if min_radius <= 0 or max_radius <= 0:
+        return False
+
+    radius_ratio = min_radius / max_radius
+    overlap = circle_overlap_area(r1, r2, distance)
+    smaller_area = math.pi * min_radius * min_radius
+    overlap_ratio_smaller = overlap / smaller_area if smaller_area > 0 else 0.0
+
+    # 密集区重复标注常表现为：中心落在同一树冠核心附近，但圆被局部收缩后
+    # IoU 不够高。这里用中心距离作为主约束，再要求半径不能差得过离谱。
+    very_close_center = distance <= max(7.0, min_radius * 0.82)
+    dense_close_center = distance <= max(10.0, min_radius * center_factor)
+    almost_contained = (
+        distance + min_radius <= max_radius * 1.08
+        and overlap_ratio_smaller >= max(min_overlap, 0.35)
+    )
+
+    return (
+        radius_ratio >= min_radius_ratio
+        and (
+            very_close_center
+            or almost_contained
+            or (dense_close_center and overlap_ratio_smaller >= min_overlap)
+        )
+    )
+
+
+def dedupe_dense_detections(
+    detections,
+    center_factor=1.80,
+    min_overlap=0.10,
+    min_radius_ratio=0.35,
+):
+    if not detections:
+        return [], []
+
+    kept = []
+    removed = []
+    ranked = sorted(detections, key=_candidate_quality, reverse=True)
+
+    for det in ranked:
+        duplicate_of = None
+        for existing in kept:
+            if _is_dense_duplicate_candidate(
+                det,
+                existing,
+                center_factor=center_factor,
+                min_overlap=min_overlap,
+                min_radius_ratio=min_radius_ratio,
+            ):
+                duplicate_of = existing
+                break
+
+        if duplicate_of is None:
+            kept.append(det)
+            continue
+
+        rejected = dict(det)
+        rejected["local_refine_decision"] = "rejected_dense_duplicate"
+        rejected["duplicate_of_x"] = duplicate_of.get("x")
+        rejected["duplicate_of_y"] = duplicate_of.get("y")
+        rejected["duplicate_of_radius"] = duplicate_of.get("radius")
+        removed.append(rejected)
+
+    return renumber_detections(kept), removed
 
 
 def detections_from_mask_peak_radius(
@@ -1496,6 +1580,17 @@ def process_image(source: Path, out_dir: Path, args):
         )
         print(f"本地树冠核心过滤：{before_refine} -> {len(detections)}，过滤 {len(local_rejected)} 个")
 
+    if not getattr(args, "no_dense_dedupe", False):
+        before_dedupe = len(detections)
+        detections, dense_rejected = dedupe_dense_detections(
+            detections,
+            center_factor=getattr(args, "dense_dedupe_factor", 1.80),
+            min_overlap=getattr(args, "dense_dedupe_overlap", 0.10),
+        )
+        local_rejected.extend(dense_rejected)
+        if dense_rejected:
+            print(f"密集区重复去重：{before_dedupe} -> {len(detections)}，合并 {len(dense_rejected)} 个")
+
     # --- 大模型双重验证 ---
     llm_verify = getattr(args, 'llm_verify', False) or getattr(args, 'llm_repair', False)
     rejected = list(local_rejected)
@@ -1693,6 +1788,12 @@ def parse_args():
                         help="本地过滤要求圆内绿色树冠核心占比")
     parser.add_argument("--local-refine-max-radius", type=int, default=120,
                         help="本地过滤后允许的最大圆半径")
+    parser.add_argument("--no-dense-dedupe", action="store_true",
+                        help="关闭密集区域重复候选的最终去重")
+    parser.add_argument("--dense-dedupe-factor", type=float, default=1.80,
+                        help="密集区去重中心距离系数，越大越激进")
+    parser.add_argument("--dense-dedupe-overlap", type=float, default=0.10,
+                        help="密集区去重要求的最小小圆覆盖比例")
 
     # --- 大模型验证参数 ---
     parser.add_argument("--llm-verify", action="store_true",
