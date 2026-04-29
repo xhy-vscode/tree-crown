@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.train_venv/
+
+# Local env files
+.env
+.env.*
+
+# Temporary working folders
+.tmp/
+.tmp_check/
+.tmp_ref/
+nul
+
+# Generated outputs. Curated screenshots live in docs/assets and are intentionally kept.
+output/
+output_*/
+labels_llm/
+labels_pseudo/
+labels_from_overlay/
+runs/
+
+# Local logs
+*.log
+
+# Local datasets and demo imagery
+raw_images/
+raw_images_new/
+demo_half_labeled/
+datasets/
